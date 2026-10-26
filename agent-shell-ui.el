@@ -195,6 +195,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                  (padding-start nil)
                  (padding-end nil)
                  (group-header nil)
+                 (parent-group-qualified-id nil)
+                 (parent-collapsed nil)
                  ;; Locating the block means walking back over every
                  ;; interval in it, and a streamed body accrues intervals
                  ;; per chunk, so the search costs O(chunks so far) on every
@@ -227,6 +229,9 @@ O(accumulated-body).  Label-only updates leave the body untouched."
               (when-let* ((state (get-text-property existing-start
                                                     'agent-shell-ui-state))
                           (existing-group (map-elt state :group-id)))
+                (setq parent-group-qualified-id existing-group
+                      parent-collapsed
+                      (agent-shell-ui--group-collapsed-p existing-group))
                 (setq model (append model
                                     (list (cons :group-qualified-id existing-group)
                                           (cons :group-indent
@@ -238,8 +243,15 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                   :group-label (map-elt model :group-label)
                                   :expanded (map-elt model :group-expanded)
                                   :navigation navigation))
+              (setq parent-group-qualified-id
+                    (map-elt group-header :qualified-id)
+                    parent-collapsed
+                    (agent-shell-ui--group-collapsed-p
+                     parent-group-qualified-id))
               (setq model (append model
-                                  (list (cons :group-qualified-id (map-elt group-header :qualified-id))
+                                  (list (cons :group-qualified-id
+                                              (map-elt group-header
+                                                       :qualified-id))
                                         (cons :group-indent "  "))))))
             (when (or new-label-left new-label-right new-body)
               (cond
@@ -335,24 +347,71 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                           (delete-region block-start current-block-end)
                           (goto-char block-start)
                           (agent-shell-ui--insert-fragment
-                           final-model qualified-id (not collapsed) navigation))))))
+                           final-model qualified-id (not collapsed) navigation)
+                          (agent-shell-ui--apply-own-collapsed block-start))))))
                   (setq padding-end (or (marker-position block-end) (point)))))
                ;; New group child, inserted into the group's region.  The
                ;; group's trailing separator (after the header) already sits
                ;; below, so no trailing newlines are added here.
                ((map-elt model :group-qualified-id)
-                (goto-char (agent-shell-ui--group-insertion-point
-                            :group-qualified-id (map-elt model :group-qualified-id)))
-                (setq padding-start (point))
-                (agent-shell-ui--insert-read-only (agent-shell-ui--required-newlines 2))
-                (setq block-start (point))
-                (agent-shell-ui--insert-fragment model qualified-id effective-expanded navigation)
-                ;; The group's trailing separator (the header's `\n\n', inserted
-                ;; once) now sits right after this last child; fold it into
-                ;; this child's padding so it is not stranded outside every
-                ;; block's range.
-                (skip-chars-forward "\n")
-                (setq padding-end (point)))
+                (let* ((parent-header
+                        (agent-shell-ui--group-header-range
+                         parent-group-qualified-id))
+                       (insertion-point
+                        (agent-shell-ui--group-insertion-point
+                         :group-qualified-id parent-group-qualified-id))
+                       (previous-child
+                        (when (> insertion-point (point-min))
+                          (let ((state
+                                 (get-text-property
+                                  (1- insertion-point)
+                                  'agent-shell-ui-state)))
+                            (when (equal (map-elt state :group-id)
+                                         parent-group-qualified-id)
+                              (agent-shell-ui--block-range
+                               :position (1- insertion-point)))))))
+                  (goto-char insertion-point)
+                  (setq padding-start (point))
+                  ;; The group header needs only the line break that starts
+                  ;; its details.  Later children need the full two-newline
+                  ;; boundary whose optional first newline belongs to the
+                  ;; preceding child.
+                  (agent-shell-ui--insert-read-only
+                   (agent-shell-ui--required-newlines
+                    (if previous-child 2 1)))
+                  (setq block-start (point))
+                  (agent-shell-ui--insert-fragment
+                   model qualified-id effective-expanded navigation)
+                  (let ((child-end (point)))
+                    ;; The group's trailing separator (inserted with the
+                    ;; header) now sits right after this last child; fold it
+                    ;; into this child's padding so it is not stranded
+                    ;; outside every block's range.
+                    (skip-chars-forward "\n")
+                    (setq padding-end (point))
+                    ;; Inserting another child transfers the new inter-child
+                    ;; gap to the former last child.  Reapply that child's
+                    ;; fold state, then let the parent group own the final
+                    ;; gap after the new last child.
+                    (when previous-child
+                      (agent-shell-ui--apply-own-collapsed
+                       (map-elt previous-child :start)))
+                    (agent-shell-ui--apply-own-collapsed block-start)
+                    ;; A newly inserted child must inherit the parent's fold
+                    ;; immediately.  This range starts at the child's leading
+                    ;; separator and ends before the parent's final fold gap.
+                    (when parent-collapsed
+                      (put-text-property padding-start child-end
+                                         'invisible t))
+                    (agent-shell-ui--set-fold-gap-hidden
+                     child-end parent-collapsed)
+                    ;; The header cache's end marker advances when a child is
+                    ;; inserted exactly at that boundary.  Restore its known
+                    ;; pre-insertion range so the following summary update
+                    ;; replaces the header instead of inserting a duplicate
+                    ;; top-level fragment.
+                    (agent-shell-ui--cache-block
+                     parent-group-qualified-id parent-header))))
                ;; New block.
                (t
                 (goto-char (point-max))
@@ -361,7 +420,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 (setq block-start (point))
                 (agent-shell-ui--insert-fragment model qualified-id effective-expanded navigation)
                 (agent-shell-ui--insert-read-only "\n\n")
-                (setq padding-end (point)))))
+                (setq padding-end (point))
+                (agent-shell-ui--apply-own-collapsed block-start))))
             ;; A collapsed group's children must stay hidden across updates.
             ;; A child's own edit path (insert, or replace-label/body on an
             ;; update) restores visibility from the child's own state, which
@@ -373,13 +433,9 @@ O(accumulated-body).  Label-only updates leave the body untouched."
             ;; pass over the whole child region, and that region holds the
             ;; streamed body, so a folded group paid O(chunks so far) on
             ;; every chunk (issue #757).
-            (when-let* (((not wrote-hidden))
-                        (group-qid (map-elt model :group-qualified-id))
-                        (header (agent-shell-ui--group-header-range group-qid))
-                        (header-state (get-text-property (map-elt header :start)
-                                                         'agent-shell-ui-state))
-                        ((map-elt header-state :collapsed)))
-              (agent-shell-ui--set-group-collapsed group-qid t))
+            (when (and (not wrote-hidden) parent-collapsed)
+              (agent-shell-ui--set-group-collapsed
+               parent-group-qualified-id t))
             (when on-post-process
               (funcall on-post-process))
             (when-let* ((block-range (if block-end
@@ -674,8 +730,11 @@ When NO-UNDO is non-nil, disable undo recording for this operation."
                        (equal (map-elt state :qualified-id) qualified-id))
                      t))))
       (when match
-        (let ((block-start (prop-match-beginning match))
-              (block-end (prop-match-end match)))
+        (let* ((block-start (prop-match-beginning match))
+               (block-end (prop-match-end match))
+               (state
+                (get-text-property block-start 'agent-shell-ui-state))
+               (parent-group-id (map-elt state :group-id)))
           ;; Remove trailing vertical space that's part of the block, but
           ;; stop at the next fragment's content.  The next fragment's
           ;; leading indicator (e.g. the "  " collapse placeholder) is
@@ -688,7 +747,35 @@ When NO-UNDO is non-nil, disable undo recording for this operation."
                       (not (get-text-property (point) 'agent-shell-ui-state)))
             (forward-char 1))
           (setq block-end (point))
-          (delete-region block-start block-end))))))
+          (delete-region block-start block-end)
+          (when-let* ((group-qualified-id parent-group-id)
+                      (header
+                       (agent-shell-ui--group-header-range
+                        group-qualified-id))
+                      (header-state
+                       (get-text-property
+                        (map-elt header :start)
+                        'agent-shell-ui-state)))
+            (if (agent-shell-ui--group-child-region
+                 :group-qualified-id group-qualified-id)
+                ;; A former sibling may now be last, transferring ownership
+                ;; of its trailing fold gap back to the parent group.
+                (agent-shell-ui--set-group-collapsed
+                 group-qualified-id (map-elt header-state :collapsed))
+              ;; Removing the only child consumes its trailing separator.
+              ;; Restore the header's ordinary two-newline boundary.
+              (goto-char (map-elt header :end))
+              (let* ((separator-start (point))
+                     (separator-end
+                      (progn
+                        (skip-chars-forward "\n")
+                        (point)))
+                     (missing
+                      (- 2 (- separator-end separator-start))))
+                (when (> missing 0)
+                  (goto-char separator-start)
+                  (agent-shell-ui--insert-read-only
+                   (make-string missing ?\n)))))))))))
 
 (cl-defun agent-shell-ui--block-range (&key position)
   "Get block range at POSITION if found.  Nil otherwise.
@@ -873,6 +960,14 @@ turn's cost grew with everything already in the buffer (issue #757)."
         (agent-shell-ui--cache-block group-qualified-id range)
         range)))
 
+(defun agent-shell-ui--group-collapsed-p (group-qualified-id)
+  "Return non-nil when group GROUP-QUALIFIED-ID is collapsed."
+  (when-let* ((header
+               (agent-shell-ui--group-header-range group-qualified-id)))
+    (map-elt
+     (get-text-property (map-elt header :start) 'agent-shell-ui-state)
+     :collapsed)))
+
 (cl-defun agent-shell-ui--group-children (&key group-qualified-id)
   "Return ordered child block ranges of group GROUP-QUALIFIED-ID.
 Each element is (:qualified-id ID :start S :end E).  Children are the
@@ -946,14 +1041,32 @@ under a collapsed group (issue #757)."
       (unless (= end from)
         end))))
 
+(defun agent-shell-ui--set-fold-gap-hidden (position hidden)
+  "Make the optional separator newline at POSITION match HIDDEN.
+The `agent-shell-ui-fold-gap' property distinguishes this structural
+newline from arbitrary invisible body text when later insertions count
+the newlines already present."
+  (when (eq (char-after position) ?\n)
+    (add-text-properties
+     position (1+ position)
+     `(agent-shell-ui-fold-gap t invisible ,(and hidden t)))))
+
 (cl-defun agent-shell-ui--group-child-region (&key group-qualified-id)
-  "Return (:start :end) spanning group GROUP-QUALIFIED-ID's children, or nil.
-Spans from just after the header to the end of the last child."
+  "Return the child region for group GROUP-QUALIFIED-ID, or nil.
+The alist has :start, :end, and :fold-gap.  It spans from just after the
+header through the first of the two separator newlines after the last
+child.  That newline is :fold-gap; the group hides it when collapsed and
+shows it when expanded."
   (when-let* ((header (agent-shell-ui--group-header-range group-qualified-id))
               (end (agent-shell-ui--group-children-end group-qualified-id
                                                       (map-elt header :end))))
-    (list (cons :start (map-elt header :end))
-          (cons :end end))))
+    (let ((fold-gap
+           (when (eq (char-after end) ?\n)
+             (list (cons :start end)
+                   (cons :end (1+ end))))))
+      (list (cons :start (map-elt header :end))
+            (cons :end (or (map-elt fold-gap :end) end))
+            (cons :fold-gap fold-gap)))))
 
 (cl-defun agent-shell-ui--group-insertion-point (&key group-qualified-id)
   "Return the buffer position for a new child of group GROUP-QUALIFIED-ID.
@@ -998,6 +1111,32 @@ plus its surrounding padding."
                 :from (map-elt block :start) :to (map-elt block :end))
                :end)))
 
+(defun agent-shell-ui--leaf-owns-fold-gap-p (state block)
+  "Return non-nil when leaf STATE and BLOCK own their trailing fold gap.
+A top-level leaf always owns it.  A grouped leaf owns the boundary
+before a later sibling; the parent group owns the boundary after its
+last child."
+  (if-let* ((group-qualified-id (map-elt state :group-id)))
+      (save-mark-and-excursion
+        (goto-char (map-elt block :end))
+        (skip-chars-forward " \t\n")
+        (equal (map-elt (get-text-property
+                         (point) 'agent-shell-ui-state)
+                        :group-id)
+               group-qualified-id))
+    t))
+
+(defun agent-shell-ui--set-leaf-collapsed (state block body collapsed)
+  "Set leaf STATE's BODY in BLOCK to COLLAPSED.
+The fold includes the optional trailing gap when this leaf owns that
+boundary.  The parent group owns the final gap after its last child."
+  (when-let* ((invisible-start (agent-shell-ui--labels-end block)))
+    (put-text-property invisible-start (map-elt body :end)
+                       'invisible (and collapsed t))
+    (when (agent-shell-ui--leaf-owns-fold-gap-p state block)
+      (agent-shell-ui--set-fold-gap-hidden
+       (map-elt body :end) collapsed))))
+
 (defun agent-shell-ui--set-indicator-collapsed (block collapsed)
   "Set BLOCK's fold indicator glyph to `▶'/`▼' to match COLLAPSED.
 Both glyphs are two columns wide, so surrounding positions do not shift."
@@ -1020,10 +1159,9 @@ Leaf: hide/show its body per `:collapsed'.  Group: recurse into children."
                                              (and (map-elt state :collapsed) t))
       (when-let* ((body (agent-shell-ui--nearest-range-matching-property
                          :property 'agent-shell-ui-section :value 'body
-                         :from (map-elt block :start) :to (map-elt block :end)))
-                  (invisible-start (agent-shell-ui--labels-end block)))
-        (put-text-property invisible-start (map-elt body :end)
-                           'invisible (and (map-elt state :collapsed) t))
+                         :from (map-elt block :start) :to (map-elt block :end))))
+        (agent-shell-ui--set-leaf-collapsed
+         state block body (map-elt state :collapsed))
         ;; Keep trailing newlines hidden on expand, as
         ;; `agent-shell-ui--toggle-leaf-fragment-at-point' does, so the
         ;; next child still gets its own separator.
@@ -1047,6 +1185,12 @@ expanding reveals it and restores each child's own fold state."
       (dolist (child (agent-shell-ui--group-children
                       :group-qualified-id group-qualified-id))
         (agent-shell-ui--apply-own-collapsed (map-elt child :start))))
+    ;; The final gap belongs to the group rather than its last child.
+    ;; This leaves one blank row after expanded group details even when
+    ;; the last child is itself collapsed.
+    (when-let* ((fold-gap (map-elt region :fold-gap)))
+      (agent-shell-ui--set-fold-gap-hidden
+       (map-elt fold-gap :start) collapsed))
     (agent-shell-ui--set-indicator-collapsed header collapsed)
     (map-put! state :collapsed collapsed)
     (put-text-property (map-elt header :start) (map-elt header :end)
@@ -1147,7 +1291,7 @@ indents a child's header line under its group header."
 
     (when body
       (when (or label-left label-right)
-        (insert "\n\n"))
+        (insert "\n"))
       ;; Drop any leading body newlines as newlines are
       ;; already inserted between labels and body.
       (when (string-prefix-p "\n" body)
@@ -1275,18 +1419,27 @@ When NO-UNDO is non-nil, disable undo recording."
                      (buffer-substring (point) end)))))
     (agent-shell-with-work-buffer
       (insert context)
-      ;; When counting visible newlines before point,
-      ;; we may encounter invisible text, which may
-      ;; look like newlines but gives false negatives.
-      ;; In those cases, delete any 'invisible text
-      ;; and try counting.
+      ;; Ignore arbitrary invisible body text when counting line breaks.
+      ;; Keep an invisible fold gap: it is one of the two structural
+      ;; separator newlines, merely hidden while its owner is collapsed.
+      ;; Discarding it here would make a later insertion add a replacement
+      ;; visible newline and recreate the empty row the fold removed.
       (let ((inhibit-read-only t))
         (goto-char (point-max))
         (while (not (bobp))
           (let* ((end (point))
-                 (start (previous-single-property-change end 'invisible nil (point-min))))
-            (if (get-text-property (1- end) 'invisible)
-                (delete-region start end))
+                 (invisible
+                  (get-text-property (1- end) 'invisible))
+                 (fold-gap
+                  (get-text-property (1- end) 'agent-shell-ui-fold-gap))
+                 (start
+                  (max
+                   (previous-single-property-change
+                    end 'invisible nil (point-min))
+                   (previous-single-property-change
+                    end 'agent-shell-ui-fold-gap nil (point-min)))))
+            (when (and invisible (not fold-gap))
+              (delete-region start end))
             (goto-char start))))
       (goto-char (point-max))
       (let ((pos (point)))
@@ -1323,24 +1476,11 @@ state-property range first.  User-facing toggling goes through
                             :property 'agent-shell-ui-section :value 'indicator
                             :from (map-elt block :start)
                             :to (map-elt block :end)))
-                ;; Find where labels end (either label-right or label-left)
-                (invisible-start (or (map-elt (agent-shell-ui--nearest-range-matching-property
-                                               :property 'agent-shell-ui-section :value 'label-right
-                                               :from (map-elt block :start)
-                                               :to (map-elt block :end))
-                                              :end)
-                                     (map-elt (agent-shell-ui--nearest-range-matching-property
-                                               :property 'agent-shell-ui-section :value 'label-left
-                                               :from (map-elt block :start)
-                                               :to (map-elt block :end))
-                                              :end)))
                 ;; Must be saved before deleting region.
                 (indicator-properties (text-properties-at (map-elt indicator :start))))
       (let ((new-collapsed-state (not (map-elt state :collapsed))))
-        ;; Toggle invisible text property including newlines before body
-        (put-text-property invisible-start
-                           (map-elt body :end)
-                           'invisible new-collapsed-state)
+        (agent-shell-ui--set-leaf-collapsed
+         state block body new-collapsed-state)
         ;; Update indicator
         (delete-region (map-elt indicator :start)
                        (map-elt indicator :end))

@@ -307,9 +307,15 @@ without an `agent-shell-chat--tag' are left alone."
           (agent (agent-shell-chat-mode-tests--agent-overlays)))
       (should (= 1 (length me)))
       (should (string-match-p "Me" (overlay-get (car me) 'before-string)))
+      (should-not (string-match-p
+                   "Me.*\n\n"
+                   (agent-shell-chat-mode-tests--label-string (car me))))
       (should (= 1 (length agent)))
       (should (string-match-p
-               "Claude" (agent-shell-chat-mode-tests--agent-label-string (car agent)))))))
+               "Claude" (agent-shell-chat-mode-tests--agent-label-string (car agent))))
+      (should-not (string-match-p
+                   "Claude.*\n\n"
+                   (agent-shell-chat-mode-tests--agent-label-string (car agent)))))))
 
 (ert-deftest agent-shell-chat-live-prompt-hidden-with-bar-test ()
   "The empty live prompt shows `Me', or is hidden when the bar is on."
@@ -467,11 +473,10 @@ does not reach is dropped rather than left rendering."
     (agent-shell-chat--relabel)
     (should (= 1 (length (agent-shell-chat-mode-tests--agent-overlays))))))
 
-(ert-deftest agent-shell-chat-invisible-terminator-pads-label-test ()
-  "A `Me' label keeps its blank line when the content's newline is invisible.
-A collapsed fragment hides its own trailing newline, so that newline cannot
-end the content line.  The label must then pad with a full blank line of its
-own rather than assume the hidden one separates it."
+(ert-deftest agent-shell-chat-invisible-terminator-adds-line-break-test ()
+  "A `Me' label ends content whose newline is invisible.
+A collapsed fragment hides its own trailing newline, so the label supplies
+one visible line break, but no empty display row."
   (agent-shell-chat-mode-tests--with-shell
     (insert "collapsed output")
     ;; The fragment's trailing newline, hidden as a collapsed fragment does.
@@ -484,17 +489,10 @@ own rather than assume the hidden one separates it."
     (agent-shell-chat--relabel)
     (let ((before (agent-shell-chat-mode-tests--label-string
                    (car (agent-shell-chat-mode-tests--me-overlays)))))
-      ;; One newline ends the content line the hidden one could not.  The
-      ;; blank line separating the label is the newline the rows are laid
-      ;; past, so the label closes with a blank line of its own instead.
-      (should (string-prefix-p "\n Me " before))
-      (should-not (string-prefix-p "\n\n" before))
-      (should (string-suffix-p "\n\n" before)))))
+      (should (equal "\n Me \n" (substring-no-properties before))))))
 
-(ert-deftest agent-shell-chat-visible-terminator-single-lead-test ()
-  "A `Me' label adds one newline when the content's newline is visible.
-The visible terminator already ends the content line, so a second newline
-would render two blank lines instead of one."
+(ert-deftest agent-shell-chat-visible-terminator-needs-no-lead-test ()
+  "A `Me' label adds no newline when content has a visible terminator."
   (agent-shell-chat-mode-tests--with-shell
     (insert "plain output\n")
     (agent-shell-chat-mode-tests--prompt "Claude> ")
@@ -504,8 +502,7 @@ would render two blank lines instead of one."
     (agent-shell-chat--relabel)
     (let ((before (overlay-get (car (agent-shell-chat-mode-tests--me-overlays))
                                'before-string)))
-      (should (string-prefix-p "\n" before))
-      (should-not (string-prefix-p "\n\n" before)))))
+      (should (equal " Me \n" (substring-no-properties before))))))
 
 (ert-deftest agent-shell-chat-nothing-shown-at-prompt-test ()
   "Nothing is shown at the prompt position itself.
@@ -561,8 +558,7 @@ any (contrast a `before-string', which would not -- see #786)."
 
 (ert-deftest agent-shell-chat-decorates-prompt-region-test ()
   "A prompt read outside the shell is hidden behind the `Me' label.
-Laid out as the shell lays out its own live prompt: the label, one blank
-line, then the marker the input follows."
+The marker follows the label on the next line, without a blank row."
   (with-temp-buffer
     (insert "Claude> ")
     (let ((before (overlay-get (agent-shell-chat--decorate-prompt-region
@@ -570,7 +566,8 @@ line, then the marker the input follows."
                                'before-string)))
       (should (string-match-p "Me" before))
       (should (string-match-p "❯" before))
-      (should (string-match-p "Me.*\n\n.*❯" before)))))
+      (should (string-match-p "Me.*\n.*❯" before))
+      (should-not (string-match-p "Me.*\n\n.*❯" before)))))
 
 (ert-deftest agent-shell-chat-queued-prompt-skips-plain-shell-test ()
   "A queued prompt for a shell without chat mode is left undecorated."
@@ -991,7 +988,7 @@ With no newline above to ride, the label and marker share the prompt's
                                  (overlay-get me 'before-string)))
         (agent-shell-chat-mode-tests--beat 'busy 1)
         (agent-shell-chat--animate-live-marker)
-        (should (string-suffix-p (concat " Me \n\n" (agent-shell-chat-mode-tests--busy-marker 1))
+        (should (string-suffix-p (concat " Me \n" (agent-shell-chat-mode-tests--busy-marker 1))
                                  (overlay-get me 'before-string)))))))
 
 (ert-deftest agent-shell-chat-live-marker-aligns-past-frame-test ()
@@ -1449,11 +1446,10 @@ The overlay starts past the `:extend' background and drops its `line-prefix'."
   (should-not (agent-shell-chat--extends-bg-p 'agent-shell-chat-mode-tests--plain))
   (should-not (agent-shell-chat--extends-bg-p nil)))
 
-(ert-deftest agent-shell-chat-label-after-interrupted-turn-test ()
-  "A label after an interrupted turn keeps one blank line before it.
-An interrupted turn appends its notice right before the end-of-prompt
-marker, so the turn ends mid-line, and its empty response carries no
-agent label whose pad would separate the next label."
+(ert-deftest agent-shell-chat-label-after-interrupted-turn-breaks-line-test ()
+  "A label after an interrupted turn starts on the next line.
+An interrupted turn ends mid-line, so its label needs a line break but
+no blank row around it."
   (agent-shell-chat-mode-tests--with-shell
     (agent-shell-chat-mode-tests--prompt "Claude> ")
     (insert "do the thing[Request interrupted by user]")
@@ -1464,16 +1460,10 @@ agent label whose pad would separate the next label."
       (agent-shell-chat--relabel))
     (let ((before (agent-shell-chat-mode-tests--label-string
                    (car (last (agent-shell-chat-mode-tests--me-overlays))))))
-      ;; Ends the interrupted line.  The blank line above is the newline
-      ;; the rows are laid past, so the label closes with one of its own.
-      (should (string-prefix-p "\n Me " (substring-no-properties before)))
-      (should-not (string-prefix-p "\n\n" (substring-no-properties before)))
-      (should (string-suffix-p "\n\n" (substring-no-properties before))))))
+      (should (equal "\n Me \n" (substring-no-properties before))))))
 
-(ert-deftest agent-shell-chat-label-after-own-line-marker-test ()
-  "A label after a marker that starts its line keeps one blank line before it.
-The marker's own line is already empty, so a single newline ends it and
-leaves exactly one blank line (a full pad would leave two)."
+(ert-deftest agent-shell-chat-label-after-own-line-marker-needs-no-lead-test ()
+  "A label after a marker on its own line needs no additional line break."
   (agent-shell-chat-mode-tests--with-shell
     (agent-shell-chat-mode-tests--prompt "Claude> ")
     (insert "do the thing\n")
@@ -1485,11 +1475,7 @@ leaves exactly one blank line (a full pad would leave two)."
     (let ((before (substring-no-properties
                    (agent-shell-chat-mode-tests--label-string
                     (car (last (agent-shell-chat-mode-tests--me-overlays)))))))
-      ;; The marker's line is already empty and the rows are laid past the
-      ;; newline closing it, so the label opens straight onto its own row.
-      (should (string-prefix-p " Me " before))
-      (should-not (string-prefix-p "\n" before))
-      (should (string-suffix-p "\n\n" before)))))
+      (should (equal " Me \n" before)))))
 
 (ert-deftest agent-shell-chat-marker-starts-line-p-test ()
   "The marker is recognized as starting its line only when a newline precedes it."
@@ -1503,10 +1489,9 @@ leaves exactly one blank line (a full pad would leave two)."
     (should-not (agent-shell-chat--marker-starts-line-p (point)))))
 
 (ert-deftest agent-shell-chat-label-after-empty-submissions-test ()
-  "A label stacked on empty submissions keeps one blank line before it.
-An empty submission renders nothing, so it emits no pad to separate the
-label below it: that label reuses the lead the hidden run would have
-used, which holds however many empty submissions stack up."
+  "A label stacked on empty submissions keeps its required line boundary.
+An empty submission renders nothing, so the next label reuses the lead
+the hidden run would have used."
   (agent-shell-chat-mode-tests--with-shell
     (agent-shell-chat-mode-tests--prompt "Claude> ")
     (insert "hello\n")
@@ -1527,12 +1512,60 @@ used, which holds however many empty submissions stack up."
       ;; Both empty submissions stay hidden.
       (should (equal "" (funcall before (nth 1 overlays))))
       (should (equal "" (funcall before (nth 2 overlays))))
-      ;; The live label still keeps exactly one blank line above it, which
-      ;; is the newline its rows are laid past; it closes with one of its own.
+      ;; The hidden prompts leave no empty rows around the live label.
       (let ((live (funcall before (nth 3 overlays))))
-        (should (string-prefix-p " Me " live))
-        (should-not (string-prefix-p "\n" live))
-        (should (string-suffix-p "\n\n" live))))))
+        (should (equal " Me \n" live))))))
+
+(ert-deftest agent-shell-chat-compact-conversation-test ()
+  "Rendered turns and the live prompt have no extra blank rows."
+  (agent-shell-chat-mode-tests--with-shell
+    (setq-local agent-shell-chat-mode t)
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "question\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "\nreply\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (should (equal " Me \nquestion\n Claude \nreply\n Me \n  ❯ "
+                   (substring-no-properties
+                    (agent-shell-chat--displayed-substring
+                     (point-min) (point-max)))))))
+
+(ert-deftest agent-shell-chat-compact-short-prompt-fallback-test ()
+  "A prompt too short for split rows still separates the label and input."
+  (agent-shell-chat-mode-tests--with-shell
+    (setq-local agent-shell-chat-mode t)
+    (insert "output")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "\n\n")
+    (agent-shell-chat-mode-tests--prompt ">")
+    (insert "typed\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "\nreply\n")
+    (agent-shell-chat--relabel)
+    (let ((shown (substring-no-properties
+                  (agent-shell-chat--displayed-substring
+                   (point-min) (point-max)))))
+      ;; The unlabelled marker stays in this substring as invisible text;
+      ;; assert the layout starting at the label rather than at that marker.
+      (should (string-match-p "\n Me \ntyped" shown))
+      (should-not (string-match-p "\n\n" shown)))))
+
+(ert-deftest agent-shell-chat-compact-short-live-prompt-test ()
+  "A one-character live prompt keeps its marker when the label is compact."
+  (agent-shell-chat-mode-tests--with-shell
+    (setq-local agent-shell-chat-mode t)
+    (insert "output\n\n")
+    (agent-shell-chat-mode-tests--prompt ">")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (let ((me (car (agent-shell-chat-mode-tests--me-overlays))))
+      (should (< (overlay-start me) (overlay-end me))))
+    (should (equal "output\n Me \n  ❯ "
+                   (substring-no-properties
+                    (agent-shell-chat--displayed-substring
+                     (point-min) (point-max)))))))
 
 (provide 'agent-shell-chat-mode-tests)
 ;;; agent-shell-chat-mode-tests.el ends here

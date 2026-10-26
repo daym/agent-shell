@@ -5,6 +5,18 @@
 
 ;;; Code:
 
+(defun agent-shell-ui-tests--visible-string ()
+  "Return the current buffer's characters that Emacs considers visible.
+For example, a buffer containing `aXb' with X invisible returns `ab'."
+  (let (characters)
+    (save-excursion
+      (goto-char (point-min))
+      (while (< (point) (point-max))
+        (unless (invisible-p (point))
+          (setq characters (cons (char-after) characters)))
+        (forward-char 1)))
+    (apply #'string (seq-reverse characters))))
+
 (ert-deftest agent-shell-ui-create-new-fragment-preserves-existing-test ()
   "Creating a fragment with a reused ID preserves the earlier fragment."
   (with-temp-buffer
@@ -64,6 +76,18 @@ pays for it on each insertion (see PR #897)."
   (with-temp-buffer
     (insert "\n\n")
     (should-not (agent-shell-ui--body-invisible-p (point-min) (point-max)))))
+
+(ert-deftest agent-shell-ui-required-newlines-distinguishes-fold-gap-test ()
+  "Only a marked fold gap counts as a structural invisible newline."
+  (with-temp-buffer
+    (insert "content\n\n")
+    (put-text-property (- (point-max) 2) (1- (point-max)) 'invisible t)
+    (should (equal "\n"
+                   (agent-shell-ui--required-newlines 2)))
+    (put-text-property (- (point-max) 2) (1- (point-max))
+                       'agent-shell-ui-fold-gap t)
+    (should (equal ""
+                   (agent-shell-ui--required-newlines 2)))))
 
 (ert-deftest agent-shell-ui-indent-text-preserves-caller-text-properties ()
   ;; A pre-rendered body (eg. a diff tagged `agent-shell-markdown-frozen')
@@ -702,6 +726,22 @@ straight into the next block's leading spaces."
             (should (equal "  " (buffer-substring-no-properties start (+ start 2))))))
       (kill-buffer buf))))
 
+(ert-deftest agent-shell-ui-compact-heading-body-spacing-test ()
+  "Put a fragment body directly below its heading."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (let* ((fragment
+            (agent-shell-ui-update-fragment
+             (agent-shell-ui-make-fragment-model
+              :namespace-id "ns" :block-id "fragment"
+              :label-left "Heading" :body "body")
+             :expanded t :navigation 'always))
+           (label-end (map-nested-elt fragment '(:label-left :end)))
+           (body-start (map-nested-elt fragment '(:body :start))))
+      (should (equal "\n"
+                     (buffer-substring-no-properties
+                      label-end body-start))))))
+
 ;;; groups
 
 (defun agent-shell-ui-tests--group-child-ids (group-qualified-id)
@@ -809,6 +849,135 @@ caller stamping ranges leaves it unmarked, stranding navigation there)."
       (should-not (get-text-property (child-start 1) 'invisible))
       (should (get-text-property (body-start 0) 'invisible))
       (should-not (get-text-property (body-start 1) 'invisible)))))
+
+(ert-deftest agent-shell-ui-collapsed-leaf-hides-its-trailing-gap-test ()
+  "A folded leaf leaves one line break; opening it restores its trailing gap."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "leaf"
+      :label-left "Tool result: Read")
+     :navigation 'always)
+    ;; Tool calls commonly acquire their result body after the label.
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "leaf" :body "Detail")
+     :navigation 'always)
+    (agent-shell-ui-update-text
+     :namespace-id "ns" :block-id "following" :text "Following")
+    (should
+     (string-suffix-p
+      "▶ Tool result: Read\nFollowing"
+      (agent-shell-ui-tests--visible-string)))
+    (goto-char
+     (map-elt (agent-shell-ui--block-range
+               :position
+               (map-elt (agent-shell-ui--cached-block "ns-leaf") :start))
+              :start))
+    (agent-shell-ui--toggle-fragment-at-point)
+    (should
+     (string-suffix-p
+      "▼ Tool result: Read\nDetail\n\nFollowing"
+      (agent-shell-ui-tests--visible-string)))
+    (agent-shell-ui--toggle-fragment-at-point)
+    (should
+     (string-suffix-p
+      "▶ Tool result: Read\nFollowing"
+      (agent-shell-ui-tests--visible-string)))))
+
+(ert-deftest agent-shell-ui-collapsed-group-hides-its-trailing-gap-test ()
+  "Later output does not restore a folded group's trailing empty row."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (dolist (name '("Read" "Grep" "Bash"))
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id "ns" :block-id name :group-id "group"
+        :group-label "Ran 3 tool calls" :group-expanded t
+        :label-left (concat "Tool result: " name) :body "Detail")
+       :navigation 'always))
+    (let ((inhibit-read-only t))
+      (agent-shell-ui--set-group-collapsed "ns-group" t))
+    (agent-shell-ui-update-text
+     :namespace-id "ns" :block-id "following" :text "Following")
+    (should
+     (string-suffix-p
+      "▶ Ran 3 tool calls\nFollowing"
+      (agent-shell-ui-tests--visible-string)))
+    (let ((inhibit-read-only t))
+      (agent-shell-ui--set-group-collapsed "ns-group" nil))
+    (should
+     (string-suffix-p
+      "▼ Ran 3 tool calls
+▶ Tool result: Read
+▶ Tool result: Grep
+▶ Tool result: Bash
+
+Following"
+      (agent-shell-ui-tests--visible-string)))
+    (let ((inhibit-read-only t))
+      (agent-shell-ui--set-group-collapsed "ns-group" t))
+    (should
+     (string-suffix-p
+      "▶ Ran 3 tool calls\nFollowing"
+      (agent-shell-ui-tests--visible-string)))))
+
+(ert-deftest agent-shell-ui-group-header-relabels-after-child-insertion-test ()
+  "Relabel one group in place as successive children arrive."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "todo"
+      :group-id "group" :group-label "Activity"
+      :label-left "TodoWrite" :body "Detail")
+     :navigation 'always)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "group"
+      :label-left "TodoWrite")
+     :navigation 'always)
+    (should
+     (equal "
+
+▼ TodoWrite
+▶ TodoWrite
+
+"
+            (agent-shell-ui-tests--visible-string)))
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "glob"
+      :group-id "group" :group-label "Activity"
+      :label-left "Find Glob" :body "Detail")
+     :navigation 'always)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "group"
+      :label-left "Run a tool call, run a search")
+     :navigation 'always)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "grep"
+      :group-id "group" :group-label "Activity"
+      :label-left "Find Grep" :body "Detail")
+     :navigation 'always)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "group"
+      :label-left "Run a tool call, run 2 searches")
+     :navigation 'always)
+    (should
+     (equal "
+
+▼ Run a tool call, run 2 searches
+▶ TodoWrite
+▶ Find Glob
+▶ Find Grep
+
+"
+            (agent-shell-ui-tests--visible-string)))))
 
 (ert-deftest agent-shell-ui-set-group-collapsed-by-id-test ()
   "Setting a group's fold state by id is idempotent and leaves leaves alone."
@@ -1119,6 +1288,41 @@ would put it."
     (agent-shell-ui-delete-fragment :namespace-id "ns" :block-id "m1")
     (should (agent-shell-ui--group-header-range "ns-grp"))
     (should (equal '("ns-m2") (agent-shell-ui-tests--group-child-ids "ns-grp")))))
+
+(ert-deftest agent-shell-ui-group-delete-last-child-transfers-fold-gap-test ()
+  "The parent group owns the trailing gap after its new last child."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (dolist (id '("m1" "m2"))
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id "ns" :block-id id :group-id "grp"
+        :group-label "Group" :group-expanded t
+        :label-left id :body "Detail")
+       :navigation 'always))
+    (agent-shell-ui-delete-fragment :namespace-id "ns" :block-id "m2")
+    (agent-shell-ui-update-text
+     :namespace-id "ns" :block-id "following" :text "Following")
+    (should
+     (string-suffix-p
+      "▼ Group\n▶ m1\n\nFollowing"
+      (agent-shell-ui-tests--visible-string)))))
+
+(ert-deftest agent-shell-ui-group-delete-only-child-restores-separator-test ()
+  "Deleting a group's only child leaves the header's two-newline separator."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "m1" :group-id "grp"
+      :group-label "Group" :group-expanded t
+      :label-left "m1" :body "Detail")
+     :navigation 'always)
+    (agent-shell-ui-delete-fragment :namespace-id "ns" :block-id "m1")
+    (goto-char (map-elt (agent-shell-ui--group-header-range "ns-grp") :end))
+    (let ((start (point)))
+      (skip-chars-forward "\n")
+      (should (= 2 (- (point) start))))))
 
 (ert-deftest agent-shell-ui-group-children-stops-when-block-range-stalls-test ()
   "Child enumeration stops when a block range fails to advance.

@@ -316,7 +316,7 @@ so this marks whitespace the prompt overlay must not swallow."
   "Return non-nil when the end-of-prompt marker ending at POS starts its line.
 POS is just past the marker's last character.  An interrupted turn
 appends its notice right before the marker, leaving the marker mid-line,
-so a label following it needs a full pad rather than a single newline."
+so a label following it needs a line break rather than none."
   (let ((beg pos))
     (while (and (> beg (point-min))
                 (get-text-property (1- beg) 'shell-maker--marker))
@@ -649,12 +649,11 @@ Input is bounded by the next prompt, not just the
 starts): `Me' shows the instant a prompt is submitted, and an empty
 prompt does not claim the fresh prompt below as its input.
 
-Blank lines around the prompt collapse to exactly one on each side.  The
-label rides the one above rather than covering it, so that nothing is
-shown at the prompt itself, and the marker travels as a `line-prefix':
-a string standing at the prompt holds point and the cursor on the row
-above, putting the first line of a multi-line input out of reach of
-`previous-line'.  Updates in place."
+Whitespace around the prompt collapses without leaving empty display
+rows.  Label rows replace the covered prompt rather than adding a
+multi-row string above the input, keeping the first line of a multi-line
+input reachable by `previous-line'.  A prompt too short to hold the rows
+carries the label on the newline above instead.  Updates in place."
   (save-excursion
     (let ((ranges (agent-shell-prompt-ranges))
           (prev-end nil)
@@ -691,7 +690,7 @@ above, putting the first line of a multi-line input out of reach of
                                          (get-text-property (point) 'face)))
                               (forward-char 1))
                             (point)))
-               ;; Classify what precedes the label: drives the leading pad and
+               ;; Classify what precedes the label: drives the leading break and
                ;; whether a line terminator must be kept.
                (stacked (and prev-end (= raw-start prev-end)))
                (after-marker (and (> raw-start (point-min))
@@ -708,10 +707,8 @@ above, putting the first line of a multi-line input out of reach of
                                (< raw-start pos) (eq (char-after raw-start) ?\n)
                                ;; Only a visible terminator ends the content
                                ;; line.  A collapsed fragment hides its own
-                               ;; trailing newline, and leaving that outside
-                               ;; the label spends the single leading newline
-                               ;; ending the line instead of separating it,
-                               ;; butting the label against the content.
+                               ;; trailing newline, so the label must supply
+                               ;; the line break instead.
                                (not (get-char-property raw-start 'invisible))))
                (start (if keep-term (1+ raw-start) raw-start))
                ;; The live prompt keeps its in-progress input (never swallow
@@ -725,34 +722,32 @@ above, putting the first line of a multi-line input out of reach of
                ;; the covered text's face: a display string's unfaced chars
                ;; take the face of the text they replace, and after a code
                ;; block that is the tinted source-block background.
-               (pad (propertize "\n\n" 'face 'default))
-               ;; Leading blank lines before the label.  `pad' (two newlines)
-               ;; renders one blank line when `start' is mid-line after content.
-               ;; Several cases need fewer, to keep it at exactly one:
+               (line-break (propertize "\n" 'face 'default))
+               ;; End the preceding display line when no visible newline
+               ;; already does so.  Several cases need no additional break:
                (lead (cond
                       ;; Directly stacked on the previous prompt run (empty
                       ;; submissions in a row).  That run is hidden (an empty
-                      ;; submission is unlabeled), so it emitted no pad to
+                      ;; submission is unlabeled), so it emitted no break to
                       ;; separate this label: reuse the lead it would have
-                      ;; used, which keeps one blank line however many empty
-                      ;; submissions stack up.
+                      ;; used, which keeps the next label on its own line
+                      ;; however many empty submissions stack up.
                       (stacked (or pending-lead ""))
                       ;; Directly after an end-of-prompt marker: the response
                       ;; between it and this prompt is empty, so it carries no
-                      ;; agent label whose pad would separate them.  A marker
-                      ;; starting its line needs one newline; a turn
-                      ;; interrupted mid-line (its notice sits right before the
-                      ;; marker) needs the full pad to end that line first.
+                      ;; agent label whose line break would separate them.
+                      ;; A marker starting its line needs no extra break; a
+                      ;; turn interrupted mid-line needs one to end the notice
+                      ;; immediately before the marker.
                       (after-marker (if (agent-shell-chat--marker-starts-line-p raw-start)
-                                        (propertize "\n" 'face 'default)
-                                      pad))
-                      ;; After a code block panel: its tinted padding already
-                      ;; separates the label, so one newline keeps exactly one.
-                      (after-panel (propertize "\n" 'face 'default))
-                      ;; Terminator kept visible: it ends the content line, so
-                      ;; one newline adds the single blank line.
-                      (keep-term (propertize "\n" 'face 'default))
-                      (t pad)))
+                                        ""
+                                      line-break))
+                      ;; A code block panel's padding and a visible terminator
+                      ;; already end the preceding line.
+                      (after-panel "")
+                      (keep-term "")
+                      ((= start (point-min)) "")
+                      (t line-break)))
                ;; Whether this run is labeled at all: an empty submission
                ;; carries no `Me', and the prompt bar takes the live prompt
                ;; over entirely.
@@ -782,35 +777,32 @@ above, putting the first line of a multi-line input out of reach of
                (input-indent (cond ((or (not labeled) blank) "")
                                    (marker (agent-shell-chat--draft-indent))
                                    (t agent-shell-chat--body-indent)))
-               ;; The label, closed by the newline it rides rather than by the
-               ;; second half of `pad'.
+               ;; The fallback label is closed by the newline it rides.
+               ;; With no newline above, end the label before the input.
                (before (cond ((not labeled) "")
-                             (label-nl (concat lead me-label
-                                               (propertize "\n" 'face
-                                                           'default)))
-                             (t (concat lead me-label pad))))
+                             (label-nl (concat lead me-label))
+                             (t (concat lead me-label line-break))))
                ;; One row per covered prompt position, where the prompt is
                ;; long enough to hold them; the overlay covering the prompt
                ;; then starts past the rows rather than under them.
                ;;
-               ;; Laid past the newline above rather than before it, which
-               ;; shifts the padding by one row in each direction: that
-               ;; newline now closes the row `lead' opened with its first, and
-               ;; the label needs a blank line of its own after it (the second
-               ;; half of `pad') where it used to borrow that newline's.  What
-               ;; `lead' accounts for beyond that first newline still holds.
+               ;; These rows provide their own required line breaks.  Hide
+               ;; the newline above along with the surplus whitespace, so it
+               ;; does not leave an empty row before the label.
                (label-rows (and label-nl
                                 (agent-shell-chat--label-rows
-                                 (concat (string-remove-prefix "\n" lead)
-                                         me-label pad))))
-               ;; Whether the covered prompt has a position for every row.
-               (split (<= (length label-rows) (- run-end pos)))
-               (label-start (if split (+ pos (length label-rows)) pos)))
-          ;; Collapse whatever blank lines precede the one the label rides.
-          (when (and label-nl (> label-nl start))
+                                 (concat lead me-label line-break))))
+               ;; Each row needs a position, and a live marker must still
+               ;; cover at least one character for its `display' to render.
+               (split (<= (length label-rows)
+                          (- run-end pos (if marker 1 0))))
+               (label-start (if split (+ pos (length label-rows)) pos))
+               (surplus-end (and label-nl (if split pos label-nl))))
+          ;; Keep the newline only when it carries the fallback label.
+          (when (and surplus-end (> surplus-end start))
             (push
              (agent-shell-chat--ensure-overlay
-              :tag 'me-surplus :beg start :end label-nl
+              :tag 'me-surplus :beg start :end surplus-end
               :props (list (cons 'display "")
                            (cons 'line-prefix "")
                            (cons 'wrap-prefix "")))
@@ -879,8 +871,8 @@ above, putting the first line of a multi-line input out of reach of
             ;; only ever applies to a submitted turn, and still drops any
             ;; tinted gutter inherited from the covered text.
             ;;
-            ;; With no newline above, the label renders here instead and each
-            ;; of its blank lines becomes a row of this line.  The marker
+            ;; With no newline above, the label renders here instead and its
+            ;; line break becomes a row of this line.  The marker
             ;; rejoins the label, and no prefix is set at all: either would
             ;; repeat down every row, marking or indenting the label along
             ;; with the input.
@@ -940,7 +932,7 @@ above, putting the first line of a multi-line input out of reach of
                 :props (list (cons 'line-prefix agent-shell-chat--body-indent)
                              (cons 'wrap-prefix agent-shell-chat--body-indent)))
                kept)))
-          ;; A hidden label emits no pad of its own, so hand its lead to
+          ;; A hidden label emits no break of its own, so hand its lead to
           ;; whichever label renders next.
           (setq pending-lead (and (not labeled) lead))
           (setq prev-end run-end)
@@ -965,9 +957,9 @@ above, putting the first line of a multi-line input out of reach of
   "Overlay the agent label before every response in the current buffer.
 
 Anchored on the invisible `<shell-maker-end-of-prompt>' marker.  Hides
-the marker and the extra blank lines around it with a `display' of \"\",
-and renders the label via a `before-string' padded by one blank line on
-each side.  Keeps the input's line terminator visible: hiding that
+the marker and extra whitespace around it with a `display' of \"\", and
+renders the label via a `before-string' on its own line.  Keeps the
+input's line terminator visible: hiding that
 newline would merge the input line into the response for line motion
 \(e.g. `end-of-visual-line').  Updates in place; idempotent."
   (save-excursion
@@ -1009,13 +1001,13 @@ newline would merge the input line into the response for line motion
                         (goto-char mbeg)
                         (skip-chars-backward " \t\n")
                         (if (re-search-forward "\n" end t) (point) mbeg)))
-               ;; With the terminator kept, one leading newline pads the label;
-               ;; without one keep two.
+               ;; A kept terminator already starts the label's line; otherwise
+               ;; add the single newline needed to end the input line.
                (before (concat (if (and (> start (point-min))
                                         (eq (char-before start) ?\n))
-                                   "\n"
-                                 "\n\n")
-                               label "\n\n"))
+                                   ""
+                                 "\n")
+                               label "\n"))
                ;; A completed turn with no response text (a tool-only turn, or
                ;; a restored empty turn) is not labeled: another marker or the
                ;; next prompt follows the marker with only whitespace between.
@@ -1135,20 +1127,18 @@ covers submissions, streaming, turn completion and `session-restored'),
 Used where the prompt is read outside the shell, so it reads the way the
 shell renders its own.  Returns the overlay.
 
-For example, over a minibuffer reading \"Claude> \", the prompt is
-replaced by the label, a blank line, and the marker the input follows:
+For example, over a minibuffer reading \"Claude> hello\", the prompt is
+replaced by the label and marker while the input remains:
 
    Me
-
-    \N{U+276F}"
+    \N{U+276F} hello"
   (let ((overlay (make-overlay beg end)))
     (overlay-put overlay 'agent-shell-chat--tag 'me)
     (overlay-put overlay 'display "")
-    ;; Laid out as the shell lays out its own live prompt, without its
-    ;; leading pad: nothing sits above this one to separate it from.
+    ;; The marker follows the label on the next display line.
     (overlay-put overlay 'before-string
                  (concat (agent-shell-chat--label "Me" 'user)
-                         (propertize "\n\n" 'face 'default)
+                         (propertize "\n" 'face 'default)
                          (propertize (concat agent-shell-chat--body-indent
                                              agent-shell-chat--prompt)
                                      'face 'default)))
